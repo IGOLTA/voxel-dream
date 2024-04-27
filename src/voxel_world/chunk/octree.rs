@@ -297,6 +297,7 @@ impl Octree {
                 };
 
                 let mut child_pos = pos;
+                let mut futures = Vec::with_capacity(8);
                 for _ in 0..8 {
                     let (child, remaining_childs) = childs.split_first_mut().unwrap();
                     childs =  remaining_childs;
