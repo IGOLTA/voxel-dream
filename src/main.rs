@@ -5,7 +5,7 @@ mod controls;
 
 use bevy::app::AppExit;
 use bevy::prelude::*;
-use bevy::window::CursorGrabMode;
+
 use bevy::window::PrimaryWindow;
 use debug::Debug;
 use controls::Controls;

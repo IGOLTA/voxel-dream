@@ -1,8 +1,9 @@
-use std::{array::from_fn, thread::current};
+use std::{array::from_fn, future};
 
-use bevy::math::I64Vec3;
+use bevy::{render::{mesh::{Indices, Mesh, PrimitiveTopology}, render_asset::RenderAssetUsages}, utils::futures};
+use ::futures::future::join_all;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OctreeContent {
     Childs([Box<Octree>; 8]),
     Voxel(Voxel)
@@ -22,6 +23,21 @@ impl OctreePosition {
     fn get_child_indice(&self, size: u8) -> usize {
         (((self.0 >> size) & 1) + (((self.1 >> size) & 1) << 1) + (((self.2 >> size) & 1) << 2)).try_into().unwrap() // entre 0 et 7
     }
+
+    fn morton_increment(&mut self, size: u8) {
+        //Code incompréhensible pour incrémenter en cartésiennes selon un shema de Morton sans convertir
+        let mut dif = self.0 & self.1 & self.2;
+        dif = (dif + (1 << size)) ^ dif; // Tous les bits qui seront modifiés par l'addition de la puissance e.
+        let mut p = (dif + (1 << size) ) >> 1; // Puissance d'arrêt de retenue        
+        let mut i = (self.0 & p) | ((self.1 & p) << 1) | ((self.2 & p) << 2);
+        i += p; // Nouveau code pour la profondeur d'arrêt de retenue
+        self.0 &= !dif; 
+        self.0 |= i & p; // Mise à jour des nouvelles positions
+        self.1 &= !dif; 
+        self.1 |= (i >> 1) & p;
+        self.2 &= !dif; 
+        self.2 |= (i >> 2) & p;
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -32,10 +48,10 @@ pub enum OctreeError {
     TooSmallToBeSplit,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Octree {
-    size: u8,
-    content: OctreeContent,
+    pub size: u8,
+    pub content: OctreeContent,
 
 }
 
@@ -143,9 +159,163 @@ impl Octree {
     }
 
     pub fn cart_size(&self) -> u64 {
-        (2 as u64).pow(self.size as u32)
+        Self::octree_size_to_cartestian(self.size)
     }
+
+    pub fn octree_size_to_cartestian(size: u8) -> u64 {
+        (2 as u64).pow(size as u32)
+    }
+
+    pub fn optimize(& mut self) {
+        let mut pos = OctreePosition(0, 0, 0);
+        let limit =  self.cart_size();
+        while pos.0 < limit && pos.1 < limit && pos.2 < limit {
+            let voxel;
+            let deepest_cube_size;
+
+            {
+                let deepest_cube = self.get_cube(pos, 0).unwrap();
+
+                voxel = match deepest_cube.content {
+                    OctreeContent::Childs(_) => panic!("Deepest cube can't have childs"),
+                    OctreeContent::Voxel(voxel) => voxel,
+                };
+                deepest_cube_size = deepest_cube.size;
+            }
+            
+            if let Ok(mut parent) = self.get_cube_mut(pos, deepest_cube_size + 1) {
+                let mut all_childs_same_voxel = true;
+                let childs = match parent.content {
+                    OctreeContent::Childs(ref mut childs) => childs,
+                    OctreeContent::Voxel(voxel) => panic!("Parents have childs"),
+                };
+    
+                for child in childs {
+                    if let OctreeContent::Voxel(child_voxel) = child.content {
+                        if child_voxel != voxel {
+                            all_childs_same_voxel = false
+                        }
+                    } else {
+                        all_childs_same_voxel = false;
+                    }
+                } 
+
+                if all_childs_same_voxel {
+                    parent.content = OctreeContent::Voxel(voxel);
+                    continue;
+                }
+            }
+
+            pos.morton_increment(deepest_cube_size);       
+
+        }
+    }
+
+    pub async fn fill_with_heigh_map(& mut self, heigh_map: Vec<Vec<i128>>, block_size: u8) {
+        let size_delta = self.size - block_size;
+
+        assert_eq!(heigh_map.len(), Octree::octree_size_to_cartestian(size_delta) as usize, "Heigh map octree size and block size are not matching");
+        assert_eq!(heigh_map[0].len(), Octree::octree_size_to_cartestian(size_delta) as usize, "Heigh map octree size and block size are not matching");
+
+        let (lowest_point_res, highest_point_res)  = Self::generate_res_high_maps(heigh_map, size_delta).await;
+
+        self.content = OctreeContent::Voxel(Voxel::Empty);
+        self.apply_res_heigh_map(block_size, OctreePosition(0, 0, 0), &lowest_point_res, &highest_point_res).await;
+
+    }
+
+    async fn generate_res_high_maps(heigh_map: Vec<Vec<i128>>, heigh_map_size: u8) -> (Vec<Vec<Vec<i128>>>, Vec<Vec<Vec<i128>>>) {
+
+        let mut highest_point_res: Vec<Vec<Vec<i128>>> = Vec::with_capacity(heigh_map_size as usize + 1);
+        let mut lowest_point_res:  Vec<Vec<Vec<i128>>> = Vec::with_capacity(heigh_map_size as usize + 1);
+        
+        highest_point_res.push(heigh_map.clone());
+        lowest_point_res.push(heigh_map);
+
+        let mut current_len = Octree::octree_size_to_cartestian(heigh_map_size) as usize;
+
+        for i in 0..heigh_map_size as usize {
+            current_len /= 2;
+            let mut highest_point: Vec<Vec<i128>> = Vec::with_capacity(current_len);
+            let mut lowest_point: Vec<Vec<i128>> = Vec::with_capacity(current_len);
+            for j in 0..current_len {
+                highest_point.push(Vec::with_capacity(current_len));
+                lowest_point.push(Vec::with_capacity(current_len));
+                for k in 0..current_len {
+                    let sub_points = [
+                        highest_point_res[i][j * 2][k * 2], 
+                        highest_point_res[i][j * 2 + 1][k * 2], 
+                        highest_point_res[i][j * 2][k * 2 + 1], 
+                        highest_point_res[i][j * 2 + 1][k * 2 + 1]
+                        ];
+                    highest_point[j].push(*sub_points.iter().max().unwrap()); 
+
+                    let sub_points = [
+                        lowest_point_res[i][j * 2][k * 2], 
+                        lowest_point_res[i][j * 2 + 1][k * 2], 
+                        lowest_point_res[i][j * 2][k * 2 + 1], 
+                        lowest_point_res[i][j * 2 + 1][k * 2 + 1]
+                        ];
+                    lowest_point[j].push(*sub_points.iter().min().unwrap()); 
+                }
+            }
+
+            highest_point_res.push(highest_point);
+            lowest_point_res.push(lowest_point);
+        }
+
+        (lowest_point_res, highest_point_res)
+    }
+
+    //Can panic if Octree is not empty
+    async fn apply_res_heigh_map(&mut self, block_size: u8, pos: OctreePosition, lowest_point_res: &Vec<Vec<Vec<i128>>>, highest_point_res: &Vec<Vec<Vec<i128>>>) {
+        if block_size == self.size {
+            let height = highest_point_res[0][pos.0 as usize][pos.2 as usize];
+            if height > pos.1 as i128 {
+                self.content = OctreeContent::Voxel(Voxel::Stone);
+            } else if height <= pos.1 as i128  {
+                self.content = OctreeContent::Voxel(Voxel::Empty);
+            }
+        } else {
+            let delta_size = self.size - block_size;
+            let map_x = pos.0 / (2 as u64).pow(delta_size as u32);
+            let map_y = pos.2 / (2 as u64).pow(delta_size as u32);
+
+            let highest_point = highest_point_res[delta_size as usize][map_x as usize][map_y as usize];
+            let lowest_point = lowest_point_res[delta_size as usize][map_x as usize][map_y as usize];
+
+            if highest_point <= pos.1 as i128 {
+                self.content = OctreeContent::Voxel(Voxel::Empty);
+            } else if lowest_point >= pos.1 as i128 + (2 as i128).pow(delta_size as u32) {
+                self.content = OctreeContent::Voxel(Voxel::Stone);
+            } else {
+                self.split().unwrap();
+
+                let mut childs: &mut [Box<Octree>] = match self.content {
+                    OctreeContent::Childs(ref mut childs) => childs,
+                    OctreeContent::Voxel(_) => panic!("This node has just been splitted but does not have childs"),
+                };
+
+                let mut child_pos = pos;
+                for _ in 0..8 {
+                    let (child, remaining_childs) = childs.split_first_mut().unwrap();
+                    childs =  remaining_childs;
+                    let future = child.apply_res_heigh_map(block_size, child_pos, lowest_point_res, highest_point_res);
+                    futures.push(future);
+                    child_pos.morton_increment(delta_size - 1);
+                }
+
+                join_all(futures).await;
+            }
+        }
+    }
+
+    pub fn relative_size(&self, size: u8) -> f32 {
+        Octree::octree_size_to_cartestian(size) as f32 / Octree::octree_size_to_cartestian(self.size) as f32
+    }
+
 }
+
 
 pub struct OctreeIterator<'a> {
     pos: OctreePosition,
@@ -175,18 +345,7 @@ impl<'a> Iterator for OctreeIterator<'a> {
         
         let previous_pos = self.pos;
 
-        //Code incompréhensible pour incrémenter en cartésiennes selon un shema de Morton sans convertir
-        let mut dif = self.pos.0 & self.pos.1 & self.pos.2;
-        dif = (dif + (1 << deepest_cube.size)) ^ dif; // Tous les bits qui seront modifiés par l'addition de la puissance e.
-        let mut p = (dif + (1 << deepest_cube.size) ) >> 1; // Puissance d'arrêt de retenue        
-        let mut i = (self.pos.0 & p) | ((self.pos.1 & p) << 1) | ((self.pos.2 & p) << 2);
-        i += p; // Nouveau code pour la profondeur d'arrêt de retenue
-        self.pos.0 &= !dif; 
-        self.pos.0 |= i & p; // Mise à jour des nouvelles positions
-        self.pos.1 &= !dif; 
-        self.pos.1 |= (i >> 1) & p;
-        self.pos.2 &= !dif; 
-        self.pos.2 |= (i >> 2) & p;
+        self.pos.morton_increment(deepest_cube.size); 
 
         let voxel = match deepest_cube.content {
             OctreeContent::Childs(_) => panic!("Deepest cube can't have childs"),
@@ -199,7 +358,34 @@ impl<'a> Iterator for OctreeIterator<'a> {
 
 #[cfg(test)]
 mod tests {
+    use bevy::tasks::block_on;
+
     use super::*;
+
+    #[test]
+    fn morton_increment() {
+        let mut pos = OctreePosition(0, 0, 0);
+
+        pos.morton_increment(0);
+        assert_eq!(pos, OctreePosition(1, 0, 0));
+        pos.morton_increment(0);
+        assert_eq!(pos, OctreePosition(0, 1, 0));
+        pos.morton_increment(0);
+        assert_eq!(pos, OctreePosition(1, 1, 0));
+        pos.morton_increment(0);
+        assert_eq!(pos, OctreePosition(0, 0, 1));
+        pos.morton_increment(0);
+        assert_eq!(pos, OctreePosition(1, 0, 1));
+        pos.morton_increment(0);
+        assert_eq!(pos, OctreePosition(0, 1, 1));
+        pos.morton_increment(0);
+        assert_eq!(pos, OctreePosition(1, 1, 1));
+        pos.morton_increment(0);
+        assert_eq!(pos, OctreePosition(2, 0, 0));
+
+        pos.morton_increment(1);
+        assert_eq!(pos, OctreePosition(0, 2, 0));
+    }
 
     #[test]
     fn get_child_indice_test() {
@@ -213,6 +399,51 @@ mod tests {
         assert_eq!(pos.get_child_indice(2), 0b010);
         assert_eq!(pos.get_child_indice(1), 0b001);
         assert_eq!(pos.get_child_indice(0), 0b110);
+    }
+
+    #[test]
+    fn test_octree_equal() {
+        let tree_1 = Octree{
+            size: 8,
+            content: OctreeContent::Childs([
+                Box::new(Octree { 
+                    size: 7, 
+                    content: OctreeContent::Voxel(Voxel::Stone)
+                }),
+                Box::new(Octree { 
+                    size: 7, 
+                    content: OctreeContent::Voxel(Voxel::Stone)
+                }),
+                Box::new(Octree { 
+                    size: 7, 
+                    content: OctreeContent::Voxel(Voxel::Empty)
+                }),
+                Box::new(Octree { 
+                    size: 7, 
+                    content: OctreeContent::Voxel(Voxel::Empty)
+                }),
+                Box::new(Octree { 
+                    size: 7, 
+                    content: OctreeContent::Voxel(Voxel::Stone)
+                }),
+                Box::new(Octree { 
+                    size: 7, 
+                    content: OctreeContent::Voxel(Voxel::Stone)
+                }),
+                Box::new(Octree { 
+                    size: 7, 
+                    content: OctreeContent::Voxel(Voxel::Empty)
+                }),
+                Box::new(Octree { 
+                    size: 7, 
+                    content: OctreeContent::Voxel(Voxel::Empty)
+                }),
+            ]),
+        };
+
+        let tree_2 = tree_1.clone();
+
+        assert_eq!(tree_1, tree_2);
     }
 
     #[test]
@@ -310,4 +541,147 @@ mod tests {
         assert_eq!(len, 7 * 7 + 8);
     }
 
+    #[test]
+    fn res_high_map_generatrion() {
+        let heigh_map: Vec<Vec<i128>> = vec![
+            vec![0, 0, 1, 2, 2, 2, 2, 2],
+            vec![1, 0, 2, 0, 1, 1, 1, 3],
+            vec![2, 2, 2, 1, 3, 4, 2, 5],
+            vec![0, 1, 1, 1, 1, 0, 1, 4],
+            vec![0, 1, 2, 0, 0, 0, -1, 2],
+            vec![3, 2, 2, 2, 1, 0, 2, 0],
+            vec![1, 1, 1, 1, 1, 1, 1, 1],
+            vec![2, 3, 2, 1, 0, 1, 3, 4],
+        ];
+
+        let (lowest_point_res, highest_point_res) = block_on(Octree::generate_res_high_maps(heigh_map.clone(), 3));
+
+        println!("Highest point: {highest_point_res:?}");
+        assert_eq!(highest_point_res, vec![
+            heigh_map.clone(),
+            vec![
+                vec![1, 2, 2, 3],
+                vec![2, 2, 4, 5],
+                vec![3, 2, 1, 2],
+                vec![3, 2, 1, 4]
+            ],
+            vec![
+                vec![2, 5],
+                vec![3, 4],
+            ],
+            vec![vec![5]]
+        ]);
+        
+        println!("Lowest point: {lowest_point_res:?}");
+        assert_eq!(lowest_point_res, vec![
+            heigh_map.clone(),
+            vec![
+                vec![0, 0, 1, 1],
+                vec![0, 1, 0, 1],
+                vec![0, 0, 0, -1],
+                vec![1, 1, 0, 1]
+            ],
+            vec![
+                vec![0, 0],
+                vec![0, -1],
+            ],
+            vec![vec![-1]]
+        ]);
+    }
+
+    #[test]
+    fn res_hight_map_application_chunk_too_high() {
+        let mut tree = Octree::new(8, None);
+
+        let heigh_map: Vec<Vec<i128>> = vec![
+            vec![0, 0, 0, 0],
+            vec![0, 0, 0, 0],
+            vec![0, 0, 0, 0],
+            vec![0, 0, 0, 0]
+        ];
+
+        let (lowest_point_res, highest_point_res) = block_on(Octree::generate_res_high_maps(heigh_map, 2));
+
+        block_on(tree.apply_res_heigh_map(6, OctreePosition(0, 0, 0), &highest_point_res, &lowest_point_res));
+
+        match tree.content {
+            OctreeContent::Childs(_) => panic!(),
+            OctreeContent::Voxel(voxel) => assert_eq!(voxel, Voxel::Empty),
+        }
+    }
+
+    #[test]
+    fn res_hight_map_application_chunk_under_ground() {
+        let mut tree = Octree::new(8, None);
+
+        let heigh_map: Vec<Vec<i128>> = vec![
+            vec![4, 4, 4, 4],
+            vec![4, 4, 4, 4],
+            vec![4, 4, 4, 4],
+            vec![4, 4, 4, 4],
+        ];
+
+        let (lowest_point_res, highest_point_res) = block_on(Octree::generate_res_high_maps(heigh_map.clone(), 2));
+
+        block_on(tree.apply_res_heigh_map(6, OctreePosition(0, 0, 0), &highest_point_res, &lowest_point_res));
+
+        match tree.content {
+            OctreeContent::Childs(_) => panic!(),
+            OctreeContent::Voxel(voxel) => assert_ne!(voxel, Voxel::Empty),
+        }
+    }
+    
+    #[test]
+    fn res_hight_map_application() {
+        let mut test_tree = Octree::new(8, None);
+
+        let heigh_map: Vec<Vec<i128>> = vec![
+            vec![1, 2],
+            vec![0, 0],
+        ];
+
+        let (lowest_point_res, highest_point_res) = block_on(Octree::generate_res_high_maps(heigh_map.clone(), 1));
+
+        block_on(test_tree.apply_res_heigh_map(7, OctreePosition(0, 0, 0), &lowest_point_res, &highest_point_res));
+        
+        let mut result_tree = Octree{
+            size: 8,
+            content: OctreeContent::Childs([
+                Box::new(Octree { 
+                    size: 7, 
+                    content: OctreeContent::Voxel(Voxel::Stone)
+                }),
+                Box::new(Octree { 
+                    size: 7, 
+                    content: OctreeContent::Voxel(Voxel::Empty)
+                }),
+                Box::new(Octree { 
+                    size: 7, 
+                    content: OctreeContent::Voxel(Voxel::Empty)
+                }),
+                Box::new(Octree { 
+                    size: 7, 
+                    content: OctreeContent::Voxel(Voxel::Empty)
+                }),
+                Box::new(Octree { 
+                    size: 7, 
+                    content: OctreeContent::Voxel(Voxel::Stone)
+                }),
+                Box::new(Octree { 
+                    size: 7, 
+                    content: OctreeContent::Voxel(Voxel::Empty)
+                }),
+                Box::new(Octree { 
+                    size: 7, 
+                    content: OctreeContent::Voxel(Voxel::Stone)
+                }),
+                Box::new(Octree { 
+                    size: 7, 
+                    content: OctreeContent::Voxel(Voxel::Empty)
+                }),
+            ]),
+        };
+
+        assert_eq!(result_tree, test_tree);
+    }
 }

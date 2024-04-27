@@ -7,3 +7,5 @@ edition = "2021"
 
 [dependencies]
 bevy = "0.13"
+futures = "0.3.30"
+noise = "0.9.0"

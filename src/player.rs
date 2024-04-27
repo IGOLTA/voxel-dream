@@ -1,13 +1,13 @@
 use bevy::{input::mouse::MouseMotion, prelude::*};
 use std::f32::consts::PI;
-use crate::controls::Controls;
+use crate::{controls::Controls, voxel_world::chunk_generator::ChunkGenerator};
 
 pub struct Player;
 
 impl Plugin for Player {
     fn build(&self, app: &mut App) {
         app
-            .add_systems(Update, (
+            .add_systems(FixedUpdate, (
                 free_view_translation,
                 free_view_rotation
             ))
@@ -83,6 +83,9 @@ fn setup (
     mut commands: Commands
 ) {
     commands.spawn((
+        ChunkGenerator {
+            render_cube_size: 4,
+        },
         FreeViewMovment {
             move_speed: 5.,
             fast_move_speed: 20., 
